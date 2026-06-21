@@ -1,5 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from 'jsr:@supabase/supabase-js@2';
+import { encrypt, decrypt } from '../_shared/crypto.ts';
+import { validateEnv } from '../_shared/env.ts';
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -7,46 +9,30 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const META_APP_ID = Deno.env.get('META_APP_ID')!;
-const META_APP_SECRET = Deno.env.get('META_APP_SECRET')!;
-const ENCRYPTION_KEY = Deno.env.get('ENCRYPTION_KEY')!;
+const env = validateEnv([
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY',
+  'ENCRYPTION_KEY',
+  'META_APP_ID',
+  'META_APP_SECRET'
+]);
 
-function decrypt(encrypted: string): string {
-  const key = ENCRYPTION_KEY;
-  const text = atob(encrypted);
-  let result = '';
-  for (let i = 0; i < text.length; i++) {
-    result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-  }
-  return result;
-}
-
-function encrypt(text: string): string {
-  const key = ENCRYPTION_KEY;
-  let result = '';
-  for (let i = 0; i < text.length; i++) {
-    result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-  }
-  return btoa(result);
-}
+const META_APP_ID = env.META_APP_ID!;
+const META_APP_SECRET = env.META_APP_SECRET!;
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
 
-  const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-  const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-  const supabase = createClient(supabaseUrl, supabaseKey);
+  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
 
   try {
-    // Get all active Meta connections that need token refresh
-    // Token should be refreshed before it expires (e.g., 7 days before)
     const sevenDaysFromNow = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
     const { data: connections, error: fetchError } = await supabase
       .from('meta_connections')
-      .select('*')
+      .select('id, encrypted_access_token, token_expires_at')
       .eq('status', 'active')
       .lt('token_expires_at', sevenDaysFromNow.toISOString());
 
@@ -54,14 +40,12 @@ Deno.serve(async (req: Request) => {
       throw fetchError;
     }
 
-    const results = [];
+    const results: Array<{ id: string; status: string; expires_at?: string; error?: string }> = [];
 
     for (const connection of connections || []) {
       try {
-        // Decrypt current token
-        const currentToken = decrypt(connection.encrypted_access_token);
+        const currentToken = await decrypt(connection.encrypted_access_token);
 
-        // Exchange for new long-lived token
         const response = await fetch(
           `https://graph.facebook.com/v19.0/oauth/access_token?` +
           `grant_type=fb_exchange_token&` +
@@ -73,7 +57,6 @@ Deno.serve(async (req: Request) => {
         const data = await response.json();
 
         if (data.error) {
-          // Update connection status to error
           await supabase
             .from('meta_connections')
             .update({
@@ -91,8 +74,7 @@ Deno.serve(async (req: Request) => {
         const newExpiresIn = data.expires_in || 5184000;
         const newExpiresAt = new Date(Date.now() + (newExpiresIn * 1000));
 
-        // Encrypt and store new token
-        const encryptedToken = encrypt(newToken);
+        const encryptedToken = await encrypt(newToken);
 
         await supabase
           .from('meta_connections')
@@ -105,10 +87,11 @@ Deno.serve(async (req: Request) => {
           })
           .eq('id', connection.id);
 
-        results.push({ id: connection.id, status: 'refreshed', expires_at: newExpiresAt });
+        results.push({ id: connection.id, status: 'refreshed', expires_at: newExpiresAt.toISOString() });
 
-      } catch (error) {
-        results.push({ id: connection.id, status: 'error', error: error.message });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error during refresh';
+        results.push({ id: connection.id, status: 'error', error: message });
       }
     }
 
@@ -120,10 +103,11 @@ Deno.serve(async (req: Request) => {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
 
-  } catch (error) {
+  } catch (error: unknown) {
     console.error('Token refresh error:', error);
+    const message = error instanceof Error ? error.message : 'Internal server error';
     return new Response(JSON.stringify({
-      error: error.message || 'Internal server error'
+      error: message
     }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }

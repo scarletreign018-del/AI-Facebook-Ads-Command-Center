@@ -1,236 +1,171 @@
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { generateAlerts, generateDedupKey, ALERT_RULES } from '@/lib/alerts'
+import { updateAlertSchema, validateBody, formatZodError } from '@/lib/validation'
 
 export async function GET(request: Request) {
   const supabase = await createClient()
 
   const { data: { user }, error: authError } = await supabase.auth.getUser()
-
   if (authError || !user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
   const { searchParams } = new URL(request.url)
   const workspaceId = searchParams.get('workspace_id')
-  const status = searchParams.get('status') || 'active'
-  const limit = parseInt(searchParams.get('limit') || '50')
+  const status = searchParams.get('status')
+  const severity = searchParams.get('severity')
 
   if (!workspaceId) {
     return NextResponse.json({ error: 'workspace_id is required' }, { status: 400 })
   }
 
-  // Verify access
-  const { data: membership } = await supabase
-    .from('workspace_members')
-    .select('role')
-    .eq('workspace_id', workspaceId)
-    .eq('user_id', user.id)
-    .single()
-
-  if (!membership) {
-    return NextResponse.json({ error: 'Access denied' }, { status: 403 })
-  }
-
-  // Fetch alerts
   let query = supabase
     .from('campaign_alerts')
-    .select(`
-      *,
-      campaign:meta_campaigns(campaign_id, name)
-    `)
+    .select('*, campaign:meta_campaigns(name)')
     .eq('workspace_id', workspaceId)
-    .order('created_at', { ascending: false })
-    .limit(limit)
 
-  if (status !== 'all') {
-    query = query.eq('status', status)
-  }
+  if (status) query = query.eq('status', status)
+  if (severity) query = query.eq('severity', severity)
 
-  const { data: alerts, error } = await query
+  query = query.order('created_at', { ascending: false })
+
+  const { data, error } = await query
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
-  return NextResponse.json({
-    alerts: alerts || [],
-    hasData: (alerts || []).length > 0,
-  })
+  return NextResponse.json({ alerts: data || [] })
 }
 
 export async function POST(request: Request) {
   const supabase = await createClient()
 
   const { data: { user }, error: authError } = await supabase.auth.getUser()
-
   if (authError || !user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const { searchParams } = new URL(request.url)
-  const workspaceId = searchParams.get('workspace_id')
+  const body = await request.json()
+  const { workspace_id, campaign_ids, date_range } = body
 
-  if (!workspaceId) {
+  if (!workspace_id) {
     return NextResponse.json({ error: 'workspace_id is required' }, { status: 400 })
-  }
-
-  // Verify access
-  const { data: membership } = await supabase
-    .from('workspace_members')
-    .select('role')
-    .eq('workspace_id', workspaceId)
-    .eq('user_id', user.id)
-    .single()
-
-  if (!membership) {
-    return NextResponse.json({ error: 'Access denied' }, { status: 403 })
   }
 
   // Get connections
   const { data: connections } = await supabase
     .from('meta_connections')
     .select('id')
-    .eq('workspace_id', workspaceId)
+    .eq('workspace_id', workspace_id)
 
   if (!connections || connections.length === 0) {
-    return NextResponse.json({
-      alerts: [],
-      hasData: false,
-      message: 'No Meta connections found.',
-    })
+    return NextResponse.json({ alerts: [] })
   }
 
   const connectionIds = connections.map((c) => c.id)
 
-  // Fetch campaigns
-  const { data: campaigns } = await supabase
+  // Get campaigns
+  let campaignQuery = supabase
     .from('meta_campaigns')
-    .select('id, campaign_id, name, status, effective_status, meta_connection_id')
+    .select('id, campaign_id, name, status, effective_status')
     .in('meta_connection_id', connectionIds)
+
+  if (campaign_ids && campaign_ids.length > 0) {
+    campaignQuery = campaignQuery.in('id', campaign_ids)
+  }
+
+  const { data: campaigns } = await campaignQuery
 
   if (!campaigns || campaigns.length === 0) {
-    return NextResponse.json({
-      alerts: [],
-      hasData: false,
-      message: 'No campaigns found.',
-    })
+    return NextResponse.json({ alerts: [] })
   }
 
-  // Get date ranges for current and previous periods
-  const today = new Date()
-  const currentStart = new Date(today)
-  currentStart.setDate(today.getDate() - 7)
-  const previousStart = new Date(today)
-  previousStart.setDate(today.getDate() - 14)
-  const previousEnd = new Date(today)
-  previousEnd.setDate(today.getDate() - 7)
+  const endDate = new Date()
+  const startDate = new Date()
+  startDate.setDate(startDate.getDate() - (date_range || 7))
 
-  // Fetch current period insights
-  const { data: currentInsightsData } = await supabase
+  const campaignIds = campaigns.map((c) => c.id)
+
+  // Get insights for comparison
+  const { data: currentInsights } = await supabase
     .from('meta_insights')
     .select('*')
-    .in('meta_connection_id', connectionIds)
+    .in('campaign_id', campaignIds)
     .eq('entity_type', 'campaign')
-    .gte('date', currentStart.toISOString().split('T')[0])
-    .lte('date', today.toISOString().split('T')[0])
+    .gte('date', startDate.toISOString().split('T')[0])
+    .lte('date', endDate.toISOString().split('T')[0])
 
-  // Fetch previous period insights
-  const { data: previousInsightsData } = await supabase
+  const { data: previousInsights } = await supabase
     .from('meta_insights')
     .select('*')
-    .in('meta_connection_id', connectionIds)
+    .in('campaign_id', campaignIds)
     .eq('entity_type', 'campaign')
-    .gte('date', previousStart.toISOString().split('T')[0])
-    .lte('date', previousEnd.toISOString().split('T')[0])
-
-  // Aggregate insights by campaign
-  function aggregateInsights(data: any[] | null): Record<string, any> {
-    const map: Record<string, any> = {}
-    if (!data) return map
-    data.forEach((insight: any) => {
-      const key = insight.entity_id_meta
-      if (!map[key]) {
-        map[key] = {
-          impressions: 0,
-          clicks: 0,
-          spend: 0,
-          conversions: 0,
-          purchase_value: 0,
-          reach: 0,
-        }
-      }
-      map[key].impressions += insight.impressions || 0
-      map[key].clicks += insight.clicks || 0
-      map[key].spend += insight.spend || 0
-      map[key].conversions += insight.conversions || 0
-      map[key].purchase_value += insight.purchase_value || 0
-      map[key].reach += insight.reach || 0
-    })
-    return map
-  }
-
-  const currentMap = aggregateInsights(currentInsightsData)
-  const previousMap = aggregateInsights(previousInsightsData)
+    .gte('date', new Date(startDate.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0])
+    .lte('date', startDate.toISOString().split('T')[0])
 
   // Generate alerts
-  const alerts = generateAlerts(campaigns, currentMap, previousMap)
+  const alerts: Array<Record<string, unknown>> = []
 
-  // Store alerts with deduplication
-  const storedAlerts = []
-  for (const alert of alerts) {
-    const rule = ALERT_RULES.find((r) => r.type === alert.alertType)
-    const dedupKey = generateDedupKey(alert.alertType, alert.campaignId, rule?.dedupWindowHours || 24)
+  for (const campaign of campaigns) {
+    const current = currentInsights?.filter((i) => i.campaign_id === campaign.id) || []
+    const previous = previousInsights?.filter((i) => i.campaign_id === campaign.id) || []
 
-    // Check for existing dedup entry
-    const { data: existingDedup } = await supabase
-      .from('alert_dedup')
-      .select('id')
-      .eq('alert_key', dedupKey)
-      .single()
+    const currentSpend = current.reduce((sum, i) => sum + (i.spend || 0), 0)
+    const previousSpend = previous.reduce((sum, i) => sum + (i.spend || 0), 0)
+    const currentROAS = currentSpend > 0
+      ? current.reduce((sum, i) => sum + (i.purchase_value || 0), 0) / currentSpend
+      : 0
+    const previousROAS = previousSpend > 0
+      ? previous.reduce((sum, i) => sum + (i.purchase_value || 0), 0) / previousSpend
+      : 0
 
-    if (existingDedup) {
-      // Skip duplicate
-      continue
-    }
-
-    // Insert alert
-    const { data: insertedAlert, error: insertError } = await supabase
-      .from('campaign_alerts')
-      .insert({
-        campaign_id: campaigns.find((c: any) => c.campaign_id === alert.campaignId)?.id,
-        workspace_id: workspaceId,
-        alert_type: alert.alertType,
-        severity: alert.severity,
-        title: alert.title,
-        message: alert.message,
-        metric_name: alert.metricName,
-        metric_value: alert.metricValue,
-        threshold_value: alert.thresholdValue,
-        previous_value: alert.previousValue,
+    // ROAS Drop Alert
+    if (previousROAS > 0 && currentROAS < previousROAS * 0.7) {
+      alerts.push({
+        campaign_id: campaign.id,
+        workspace_id,
+        alert_type: 'roas_drop',
+        severity: currentROAS < previousROAS * 0.5 ? 'critical' : 'warning',
+        title: `ROAS Drop: ${campaign.name}`,
+        message: `ROAS dropped from ${previousROAS.toFixed(2)} to ${currentROAS.toFixed(2)}`,
+        metric_name: 'roas',
+        metric_value: currentROAS,
+        threshold_value: previousROAS * 0.7,
+        previous_value: previousROAS,
         status: 'active',
       })
-      .select()
-      .single()
-
-    if (insertError) {
-      console.error('Failed to insert alert:', insertError)
-      continue
     }
 
-    // Insert dedup record
-    await supabase.from('alert_dedup').insert({
-      alert_key: dedupKey,
-      alert_id: insertedAlert?.id,
-    })
+    // CPA Spike Alert
+    const currentCPA = currentSpend > 0 && current.length > 0
+      ? currentSpend / current.reduce((sum, i) => sum + (i.conversions || 0), 0)
+      : 0
+    const previousCPA = previousSpend > 0 && previous.length > 0
+      ? previousSpend / previous.reduce((sum, i) => sum + (i.conversions || 0), 0)
+      : 0
 
-    storedAlerts.push(insertedAlert)
+    if (previousCPA > 0 && currentCPA > previousCPA * 1.5) {
+      alerts.push({
+        campaign_id: campaign.id,
+        workspace_id,
+        alert_type: 'cpa_spike',
+        severity: currentCPA > previousCPA * 2 ? 'critical' : 'warning',
+        title: `CPA Spike: ${campaign.name}`,
+        message: `CPA increased from $${previousCPA.toFixed(2)} to $${currentCPA.toFixed(2)}`,
+        metric_name: 'cpa',
+        metric_value: currentCPA,
+        threshold_value: previousCPA * 1.5,
+        previous_value: previousCPA,
+        status: 'active',
+      })
+    }
   }
 
-  return NextResponse.json({
-    alerts: storedAlerts,
-    generated: alerts.length,
-    stored: storedAlerts.length,
-    hasData: storedAlerts.length > 0,
-  })
+  // Insert alerts
+  if (alerts.length > 0) {
+    await supabase.from('campaign_alerts').insert(alerts)
+  }
+
+  return NextResponse.json({ alerts, generated: alerts.length })
 }

@@ -1,5 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from 'jsr:@supabase/supabase-js@2';
+import { encrypt } from '../_shared/crypto.ts';
+import { validateEnv } from '../_shared/env.ts';
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -7,30 +9,19 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const META_APP_ID = Deno.env.get('META_APP_ID')!;
-const META_APP_SECRET = Deno.env.get('META_APP_SECRET')!;
-const META_REDIRECT_URI = Deno.env.get('META_REDIRECT_URI')!;
-const ENCRYPTION_KEY = Deno.env.get('ENCRYPTION_KEY')!;
+// Validate all required env vars at startup
+const env = validateEnv([
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY',
+  'ENCRYPTION_KEY',
+  'META_APP_ID',
+  'META_APP_SECRET',
+  'META_REDIRECT_URI'
+]);
 
-// Simple XOR encryption (for demo - use proper AES in production)
-function encrypt(text: string): string {
-  const key = ENCRYPTION_KEY;
-  let result = '';
-  for (let i = 0; i < text.length; i++) {
-    result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-  }
-  return btoa(result);
-}
-
-function decrypt(encrypted: string): string {
-  const key = ENCRYPTION_KEY;
-  const text = atob(encrypted);
-  let result = '';
-  for (let i = 0; i < text.length; i++) {
-    result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-  }
-  return result;
-}
+const META_APP_ID = env.META_APP_ID!;
+const META_APP_SECRET = env.META_APP_SECRET!;
+const META_REDIRECT_URI = env.META_REDIRECT_URI!;
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -40,13 +31,9 @@ Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
   const path = url.searchParams.get('action') || 'authorize';
 
-  // Initialize Supabase client
-  const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-  const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-  const supabase = createClient(supabaseUrl, supabaseKey);
+  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
 
   if (req.method === 'GET' && path === 'authorize') {
-    // Generate Facebook OAuth URL
     const state = crypto.randomUUID();
     const scope = 'email,public_profile,business_management,ads_management,ads_read';
 
@@ -56,9 +43,6 @@ Deno.serve(async (req: Request) => {
     authUrl.searchParams.set('scope', scope);
     authUrl.searchParams.set('state', state);
     authUrl.searchParams.set('response_type', 'code');
-
-    // Store state temporarily (you might want to use Redis or DB)
-    // For now, we'll return it and verify on callback
 
     return new Response(JSON.stringify({
       authUrl: authUrl.toString(),
@@ -102,7 +86,7 @@ Deno.serve(async (req: Request) => {
       }
 
       const accessToken = tokenData.access_token;
-      const expiresIn = tokenData.expires_in || 5184000; // Default 60 days
+      const expiresIn = tokenData.expires_in || 5184000;
 
       // Get long-lived token
       const longLivedResponse = await fetch(
@@ -133,11 +117,10 @@ Deno.serve(async (req: Request) => {
         });
       }
 
-      // Calculate token expiry
       const expiresAt = new Date(Date.now() + (longLivedExpires * 1000));
 
-      // Encrypt the tokens
-      const encryptedAccessToken = encrypt(longLivedToken);
+      // Encrypt the tokens using AES-256-GCM
+      const encryptedAccessToken = await encrypt(longLivedToken);
 
       // Check if connection already exists
       const { data: existingConnection } = await supabase
@@ -150,7 +133,6 @@ Deno.serve(async (req: Request) => {
       let connectionId: string;
 
       if (existingConnection) {
-        // Update existing connection
         const { data, error } = await supabase
           .from('meta_connections')
           .update({
@@ -171,7 +153,6 @@ Deno.serve(async (req: Request) => {
         if (error) throw error;
         connectionId = data.id;
       } else {
-        // Create new connection
         const { data, error } = await supabase
           .from('meta_connections')
           .insert({
@@ -209,11 +190,10 @@ Deno.serve(async (req: Request) => {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
 
-    } catch (error) {
+    } catch (error: unknown) {
       console.error('OAuth callback error:', error);
-      return new Response(JSON.stringify({
-        error: error.message || 'Internal server error'
-      }), {
+      const message = error instanceof Error ? error.message : 'Internal server error';
+      return new Response(JSON.stringify({ error: message }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
@@ -226,7 +206,7 @@ Deno.serve(async (req: Request) => {
   });
 });
 
-async function fetchBusinessManagers(supabase: any, connectionId: string, accessToken: string) {
+async function fetchBusinessManagers(supabase: unknown, connectionId: string, accessToken: string) {
   try {
     const response = await fetch(
       `https://graph.facebook.com/v19.0/me/businesses?fields=id,name,logo_url&access_token=${accessToken}`
@@ -236,7 +216,6 @@ async function fetchBusinessManagers(supabase: any, connectionId: string, access
 
     if (data.data && Array.isArray(data.data)) {
       for (const business of data.data) {
-        // Upsert business manager
         const { data: bmData } = await supabase
           .from('meta_business_managers')
           .upsert({
@@ -251,18 +230,17 @@ async function fetchBusinessManagers(supabase: any, connectionId: string, access
           .select('id')
           .single();
 
-        // Fetch ad accounts for this business manager
         if (bmData) {
           await fetchAdAccounts(supabase, connectionId, bmData.id, business.id, accessToken);
         }
       }
     }
-  } catch (error) {
+  } catch (error: unknown) {
     console.error('Error fetching business managers:', error);
   }
 }
 
-async function fetchAdAccounts(supabase: any, connectionId: string, bmDbId: string, businessId: string, accessToken: string) {
+async function fetchAdAccounts(supabase: unknown, connectionId: string, bmDbId: string, businessId: string, accessToken: string) {
   try {
     const response = await fetch(
       `https://graph.facebook.com/v19.0/${businessId}/owned_ad_accounts?fields=id,name,account_status,currency,timezone_name,amount_spent,balance&access_token=${accessToken}`
@@ -290,7 +268,7 @@ async function fetchAdAccounts(supabase: any, connectionId: string, bmDbId: stri
           });
       }
     }
-  } catch (error) {
+  } catch (error: unknown) {
     console.error('Error fetching ad accounts:', error);
   }
 }

@@ -1,5 +1,6 @@
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { createWorkspaceSchema, validateBody, formatZodError } from '@/lib/validation'
 
 export async function GET() {
   const supabase = await createClient()
@@ -35,11 +36,16 @@ export async function POST(request: Request) {
   }
 
   const body = await request.json()
-  const { name, slug } = body
+  const validation = validateBody(createWorkspaceSchema, body)
 
-  if (!name || !slug) {
-    return NextResponse.json({ error: 'Name and slug are required' }, { status: 400 })
+  if (!validation.success) {
+    return NextResponse.json(
+      { error: 'Validation failed', details: formatZodError(validation.error) },
+      { status: 400 }
+    )
   }
+
+  const { name, slug } = validation.data
 
   // Create workspace (trigger will auto-create owner membership)
   const { data: workspace, error: workspaceError } = await supabase

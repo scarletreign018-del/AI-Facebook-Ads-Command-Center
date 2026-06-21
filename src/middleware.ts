@@ -1,28 +1,48 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
-// Simple in-memory rate limiter (use Redis in production)
-const rateLimitMap = new Map<string, { count: number; resetAt: number }>()
+// Redis/Upstash-based rate limiter for production
+// Falls back to in-memory for local development
+interface RateLimitEntry {
+  count: number
+  resetAt: number
+}
+
+let redisClient: { get: (key: string) => Promise<string | null>; set: (key: string, value: string, opts?: { ex: number }) => Promise<void> } | null = null
+
+async function getRedisClient() {
+  if (redisClient) return redisClient
+  const upstashUrl = process.env.UPSTASH_REDIS_REST_URL
+  const upstashToken = process.env.UPSTASH_REDIS_REST_TOKEN
+  if (upstashUrl && upstashToken) {
+    redisClient = {
+      async get(key: string) {
+        const res = await fetch(`${upstashUrl}/get/${encodeURIComponent(key)}`, {
+          headers: { Authorization: `Bearer ${upstashToken}` }
+        })
+        const data = await res.json()
+        return data.result as string | null
+      },
+      async set(key: string, value: string, opts?: { ex: number }) {
+        const url = opts?.ex
+          ? `${upstashUrl}/set/${encodeURIComponent(key)}?EX=${opts.ex}`
+          : `${upstashUrl}/set/${encodeURIComponent(key)}`
+        await fetch(url, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${upstashToken}` },
+          body: value
+        })
+      }
+    }
+  }
+  return redisClient
+}
 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000 // 1 minute
 const RATE_LIMIT_MAX_REQUESTS = 100 // per minute per IP
 
-function getRateLimitStatus(ip: string): { allowed: boolean; remaining: number; resetAt: number } {
-  const now = Date.now()
-  const entry = rateLimitMap.get(ip)
-
-  if (!entry || now > entry.resetAt) {
-    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS })
-    return { allowed: true, remaining: RATE_LIMIT_MAX_REQUESTS - 1, resetAt: now + RATE_LIMIT_WINDOW_MS }
-  }
-
-  if (entry.count >= RATE_LIMIT_MAX_REQUESTS) {
-    return { allowed: false, remaining: 0, resetAt: entry.resetAt }
-  }
-
-  entry.count++
-  return { allowed: true, remaining: RATE_LIMIT_MAX_REQUESTS - entry.count, resetAt: entry.resetAt }
-}
+// In-memory fallback for local development
+const rateLimitMap = new Map<string, RateLimitEntry>()
 
 // Clean up old entries periodically
 setInterval(() => {
@@ -34,14 +54,53 @@ setInterval(() => {
   }
 }, RATE_LIMIT_WINDOW_MS)
 
+async function getRateLimitStatus(ip: string): Promise<{ allowed: boolean; remaining: number; resetAt: number }> {
+  const redis = await getRedisClient()
+  const now = Date.now()
+  const key = `rate_limit:${ip}`
+
+  if (redis) {
+    const cached = await redis.get(key)
+    if (cached) {
+      const entry: RateLimitEntry = JSON.parse(cached)
+      if (now > entry.resetAt) {
+        const newEntry: RateLimitEntry = { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS }
+        await redis.set(key, JSON.stringify(newEntry), { ex: 60 })
+        return { allowed: true, remaining: RATE_LIMIT_MAX_REQUESTS - 1, resetAt: newEntry.resetAt }
+      }
+      if (entry.count >= RATE_LIMIT_MAX_REQUESTS) {
+        return { allowed: false, remaining: 0, resetAt: entry.resetAt }
+      }
+      entry.count++
+      await redis.set(key, JSON.stringify(entry), { ex: 60 })
+      return { allowed: true, remaining: RATE_LIMIT_MAX_REQUESTS - entry.count, resetAt: entry.resetAt }
+    }
+    const newEntry: RateLimitEntry = { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS }
+    await redis.set(key, JSON.stringify(newEntry), { ex: 60 })
+    return { allowed: true, remaining: RATE_LIMIT_MAX_REQUESTS - 1, resetAt: newEntry.resetAt }
+  }
+
+  // Fallback to in-memory
+  const entry = rateLimitMap.get(ip)
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS })
+    return { allowed: true, remaining: RATE_LIMIT_MAX_REQUESTS - 1, resetAt: now + RATE_LIMIT_WINDOW_MS }
+  }
+  if (entry.count >= RATE_LIMIT_MAX_REQUESTS) {
+    return { allowed: false, remaining: 0, resetAt: entry.resetAt }
+  }
+  entry.count++
+  return { allowed: true, remaining: RATE_LIMIT_MAX_REQUESTS - entry.count, resetAt: entry.resetAt }
+}
+
 // Audit log helper
 async function logAudit(
-  supabase: any,
+  supabase: ReturnType<typeof createServerClient>,
   event: string,
   userId: string | null,
   ip: string,
   path: string,
-  details?: Record<string, any>
+  details?: Record<string, unknown>
 ) {
   try {
     await supabase.from('audit_logs').insert({
@@ -60,7 +119,7 @@ export async function middleware(request: NextRequest) {
   const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
 
   // Rate limiting
-  const rateLimit = getRateLimitStatus(ip)
+  const rateLimit = await getRateLimitStatus(ip)
   if (!rateLimit.allowed) {
     return new NextResponse('Too Many Requests', {
       status: 429,

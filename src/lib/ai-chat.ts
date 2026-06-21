@@ -14,18 +14,46 @@ export interface DataSource {
   value?: number
 }
 
+interface CampaignRecord {
+  id: string
+  campaign_id: string
+  name: string
+  status: string
+  effective_status?: string
+}
+
+interface InsightRecord {
+  spend: number
+  purchase_value: number
+  conversions: number
+  clicks: number
+  impressions: number
+}
+
+interface TimeSeriesRecord {
+  spend?: number
+  purchase_value?: number
+  revenue?: number
+}
+
 interface CampaignContext {
-  campaigns: any[]
-  insights: Record<string, any>
-  healthScores?: Record<string, any>
-  timeSeries: any[]
+  campaigns: CampaignRecord[]
+  insights: Record<string, InsightRecord>
+  healthScores?: Record<string, unknown>
+  timeSeries: TimeSeriesRecord[]
+}
+
+interface MetricResult {
+  campaign: CampaignRecord
+  value: number
+  insight: InsightRecord
 }
 
 function generateId(): string {
-  return `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+  return `msg_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`
 }
 
-function extractCampaignMentions(query: string, campaigns: any[]): any[] {
+function extractCampaignMentions(query: string, campaigns: CampaignRecord[]): CampaignRecord[] {
   const lower = query.toLowerCase()
   return campaigns.filter((c) =>
     lower.includes(c.name.toLowerCase()) ||
@@ -34,11 +62,11 @@ function extractCampaignMentions(query: string, campaigns: any[]): any[] {
 }
 
 function getTopCampaignsByMetric(
-  campaigns: any[],
-  insights: Record<string, any>,
+  campaigns: CampaignRecord[],
+  insights: Record<string, InsightRecord>,
   metric: 'roas' | 'spend' | 'ctr' | 'cpa' | 'conversions',
   limit: number = 5
-): any[] {
+): MetricResult[] {
   const withMetrics = campaigns
     .map((c) => {
       const ins = insights[c.campaign_id]
@@ -65,11 +93,11 @@ function getTopCampaignsByMetric(
 
       return { campaign: c, value, insight: ins }
     })
-    .filter(Boolean)
+    .filter((item): item is MetricResult => item !== null)
 
   const sorted = metric === 'cpa'
-    ? withMetrics.sort((a: any, b: any) => a.value - b.value)
-    : withMetrics.sort((a: any, b: any) => b.value - a.value)
+    ? withMetrics.sort((a, b) => a.value - b.value)
+    : withMetrics.sort((a, b) => b.value - a.value)
 
   return sorted.slice(0, limit)
 }
@@ -95,17 +123,13 @@ export function processChatQuery(query: string, context: CampaignContext): {
   const lower = query.toLowerCase()
   const { campaigns, insights, timeSeries } = context
 
-  // Extract mentioned campaigns
   const mentioned = extractCampaignMentions(query, campaigns)
   const sources: DataSource[] = []
 
-  // --- Question patterns ---
-
-  // Performance overview / summary
   if (lower.includes('overview') || lower.includes('summary') || lower.includes('how are')) {
-    const totalSpend = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.spend || 0), 0)
-    const totalRevenue = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.purchase_value || 0), 0)
-    const totalConversions = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.conversions || 0), 0)
+    const totalSpend = Object.values(insights).reduce((sum: number, i) => sum + (i?.spend || 0), 0)
+    const totalRevenue = Object.values(insights).reduce((sum: number, i) => sum + (i?.purchase_value || 0), 0)
+    const totalConversions = Object.values(insights).reduce((sum: number, i) => sum + (i?.conversions || 0), 0)
     const avgRoas = totalSpend > 0 ? totalRevenue / totalSpend : 0
 
     const activeCampaigns = campaigns.filter((c) =>
@@ -128,7 +152,6 @@ export function processChatQuery(query: string, context: CampaignContext): {
     }
   }
 
-  // Top performers
   if (lower.includes('top') || lower.includes('best') || lower.includes('performing')) {
     const metric = lower.includes('roas') ? 'roas' :
       lower.includes('spend') ? 'spend' :
@@ -137,11 +160,11 @@ export function processChatQuery(query: string, context: CampaignContext): {
 
     const top = getTopCampaignsByMetric(campaigns, insights, metric, 5)
 
-    top.forEach((t: any) => {
+    top.forEach((t) => {
       sources.push({ type: 'insight', entityId: t.campaign.campaign_id, entityName: t.campaign.name, metric, value: t.value })
     })
 
-    const lines = top.map((t: any, i: number) => {
+    const lines = top.map((t, i: number) => {
       const val = metric === 'roas' ? `${t.value.toFixed(2)}x` :
         metric === 'spend' ? formatCurrency(t.value) :
         metric === 'ctr' ? formatPercent(t.value) :
@@ -157,7 +180,6 @@ export function processChatQuery(query: string, context: CampaignContext): {
     }
   }
 
-  // Worst performers / underperforming
   if (lower.includes('worst') || lower.includes('underperform') || lower.includes('poor')) {
     const metric = lower.includes('roas') ? 'roas' :
       lower.includes('cpa') ? 'cpa' :
@@ -166,11 +188,11 @@ export function processChatQuery(query: string, context: CampaignContext): {
     const top = getTopCampaignsByMetric(campaigns, insights, metric, 10)
     const worst = metric === 'cpa' ? top.slice(-5).reverse() : top.slice(0, 5).reverse()
 
-    worst.forEach((t: any) => {
+    worst.forEach((t) => {
       sources.push({ type: 'insight', entityId: t.campaign.campaign_id, entityName: t.campaign.name, metric, value: t.value })
     })
 
-    const lines = worst.map((t: any, i: number) => {
+    const lines = worst.map((t, i: number) => {
       const val = metric === 'roas' ? `${t.value.toFixed(2)}x` :
         metric === 'cpa' ? formatCurrency(t.value) :
         metric === 'ctr' ? formatPercent(t.value) :
@@ -185,88 +207,83 @@ export function processChatQuery(query: string, context: CampaignContext): {
     }
   }
 
-  // ROAS questions
   if (lower.includes('roas')) {
-    const totalSpend = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.spend || 0), 0)
-    const totalRevenue = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.purchase_value || 0), 0)
+    const totalSpend = Object.values(insights).reduce((sum: number, i) => sum + (i?.spend || 0), 0)
+    const totalRevenue = Object.values(insights).reduce((sum: number, i) => sum + (i?.purchase_value || 0), 0)
     const avgRoas = totalSpend > 0 ? totalRevenue / totalSpend : 0
 
     const topRoas = getTopCampaignsByMetric(campaigns, insights, 'roas', 3)
 
-    topRoas.forEach((t: any) => {
+    topRoas.forEach((t) => {
       sources.push({ type: 'insight', entityId: t.campaign.campaign_id, entityName: t.campaign.name, metric: 'roas', value: t.value })
     })
 
     return {
       response: `Your average ROAS is **${avgRoas.toFixed(2)}x** across all campaigns.\n\n` +
         `Top performers:\n` +
-        topRoas.map((t: any) => `- **${t.campaign.name}**: ${t.value.toFixed(2)}x`).join('\n') +
+        topRoas.map((t) => `- **${t.campaign.name}**: ${t.value.toFixed(2)}x`).join('\n') +
         `\n\n${avgRoas >= 2 ? 'This is a strong ROAS. Consider scaling your top performers.' : avgRoas >= 1 ? 'Breaking even - focus on optimizing underperformers.' : 'Below break-even - immediate attention needed on targeting and creative.'}`,
       sources,
     }
   }
 
-  // CPA questions
   if (lower.includes('cpa') || lower.includes('cost per')) {
-    const totalSpend = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.spend || 0), 0)
-    const totalConversions = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.conversions || 0), 0)
+    const totalSpend = Object.values(insights).reduce((sum: number, i) => sum + (i?.spend || 0), 0)
+    const totalConversions = Object.values(insights).reduce((sum: number, i) => sum + (i?.conversions || 0), 0)
     const avgCpa = totalConversions > 0 ? totalSpend / totalConversions : 0
 
     const bestCpa = getTopCampaignsByMetric(campaigns, insights, 'cpa', 3)
 
-    bestCpa.forEach((t: any) => {
+    bestCpa.forEach((t) => {
       sources.push({ type: 'insight', entityId: t.campaign.campaign_id, entityName: t.campaign.name, metric: 'cpa', value: t.value })
     })
 
     return {
       response: `Your average CPA is **${formatCurrency(avgCpa)}** across all campaigns.\n\n` +
         `Best CPA performers (lowest cost):\n` +
-        bestCpa.map((t: any) => `- **${t.campaign.name}**: ${formatCurrency(t.value)}`).join('\n') +
+        bestCpa.map((t) => `- **${t.campaign.name}**: ${formatCurrency(t.value)}`).join('\n') +
         `\n\n${avgCpa <= 25 ? 'Excellent CPA efficiency!' : avgCpa <= 50 ? 'Good CPA - monitor for optimization opportunities.' : 'High CPA - review audience targeting and landing page experience.'}`,
       sources,
     }
   }
 
-  // Spend questions
   if (lower.includes('spend') || lower.includes('budget') || lower.includes('cost')) {
-    const totalSpend = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.spend || 0), 0)
+    const totalSpend = Object.values(insights).reduce((sum: number, i) => sum + (i?.spend || 0), 0)
     const topSpend = getTopCampaignsByMetric(campaigns, insights, 'spend', 5)
 
-    topSpend.forEach((t: any) => {
+    topSpend.forEach((t) => {
       sources.push({ type: 'insight', entityId: t.campaign.campaign_id, entityName: t.campaign.name, metric: 'spend', value: t.value })
     })
 
     return {
       response: `Total spend across all campaigns: **${formatCurrency(totalSpend)}**\n\n` +
         `Top spending campaigns:\n` +
-        topSpend.map((t: any) => `- **${t.campaign.name}**: ${formatCurrency(t.value)}`).join('\n') +
+        topSpend.map((t) => `- **${t.campaign.name}**: ${formatCurrency(t.value)}`).join('\n') +
         `\n\nReview if your highest-spend campaigns are also your highest-performing ones.`,
       sources,
     }
   }
 
-  // CTR / engagement
   if (lower.includes('ctr') || lower.includes('click') || lower.includes('engagement')) {
-    const totalClicks = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.clicks || 0), 0)
-    const totalImpressions = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.impressions || 0), 0)
+    const totalClicks = Object.values(insights).reduce((sum: number, i) => sum + (i?.clicks || 0), 0)
+    const totalImpressions = Object.values(insights).reduce((sum: number, i) => sum + (i?.impressions || 0), 0)
     const avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0
 
     const topCtr = getTopCampaignsByMetric(campaigns, insights, 'ctr', 5)
 
-    topCtr.forEach((t: any) => {
+    topCtr.forEach((t) => {
       sources.push({ type: 'insight', entityId: t.campaign.campaign_id, entityName: t.campaign.name, metric: 'ctr', value: t.value })
     })
 
     return {
       response: `Your average CTR is **${formatPercent(avgCtr)}** across all campaigns.\n\n` +
         `Top CTR campaigns:\n` +
-        topCtr.map((t: any) => `- **${t.campaign.name}**: ${formatPercent(t.value)}`).join('\n') +
+        topCtr.map((t) => `- **${t.campaign.name}**: ${formatPercent(t.value)}`).join('\n') +
         `\n\n${avgCtr >= 1 ? 'Good engagement! Your ads are resonating with the audience.' : avgCtr >= 0.5 ? 'Average CTR - test new creatives to improve.' : 'Low CTR - your ads may not be compelling enough. Test new headlines, images, and CTAs.'}`,
       sources,
     }
   }
 
-  // Specific campaign question
   if (mentioned.length > 0) {
     const campaign = mentioned[0]
     const ins = insights[campaign.campaign_id]
@@ -300,7 +317,6 @@ export function processChatQuery(query: string, context: CampaignContext): {
     }
   }
 
-  // Trends / changes over time
   if (lower.includes('trend') || lower.includes('change') || lower.includes('over time')) {
     if (!timeSeries || timeSeries.length < 14) {
       return {
@@ -312,12 +328,12 @@ export function processChatQuery(query: string, context: CampaignContext): {
     const recent = timeSeries.slice(-7)
     const previous = timeSeries.slice(-14, -7)
 
-    const recentSpend = recent.reduce((sum: number, d: any) => sum + (d.spend || 0), 0)
-    const previousSpend = previous.reduce((sum: number, d: any) => sum + (d.spend || 0), 0)
+    const recentSpend = recent.reduce((sum: number, d) => sum + (d.spend || 0), 0)
+    const previousSpend = previous.reduce((sum: number, d) => sum + (d.spend || 0), 0)
     const spendChange = previousSpend > 0 ? ((recentSpend - previousSpend) / previousSpend) * 100 : 0
 
-    const recentRevenue = recent.reduce((sum: number, d: any) => sum + (d.purchase_value || d.revenue || 0), 0)
-    const previousRevenue = previous.reduce((sum: number, d: any) => sum + (d.purchase_value || d.revenue || 0), 0)
+    const recentRevenue = recent.reduce((sum: number, d) => sum + (d.purchase_value || d.revenue || 0), 0)
+    const previousRevenue = previous.reduce((sum: number, d) => sum + (d.purchase_value || d.revenue || 0), 0)
     const revenueChange = previousRevenue > 0 ? ((recentRevenue - previousRevenue) / previousRevenue) * 100 : 0
 
     return {
@@ -329,25 +345,24 @@ export function processChatQuery(query: string, context: CampaignContext): {
     }
   }
 
-  // Optimization / suggestions
   if (lower.includes('optimize') || lower.includes('improve') || lower.includes('suggestion') || lower.includes('recommend')) {
-    const totalSpend = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.spend || 0), 0)
-    const totalRevenue = Object.values(insights).reduce((sum: number, i: any) => sum + (i?.purchase_value || 0), 0)
+    const totalSpend = Object.values(insights).reduce((sum: number, i) => sum + (i?.spend || 0), 0)
+    const totalRevenue = Object.values(insights).reduce((sum: number, i) => sum + (i?.purchase_value || 0), 0)
     const avgRoas = totalSpend > 0 ? totalRevenue / totalSpend : 0
 
     const topRoas = getTopCampaignsByMetric(campaigns, insights, 'roas', 3)
     const worstRoas = getTopCampaignsByMetric(campaigns, insights, 'roas', 10).slice(0, 3).reverse()
 
-    topRoas.forEach((t: any) => {
+    topRoas.forEach((t) => {
       sources.push({ type: 'recommendation', entityId: t.campaign.campaign_id, entityName: t.campaign.name })
     })
 
     return {
       response: `Based on your campaign data, here are optimization suggestions:\n\n` +
         `**1. Scale Winners:**\n` +
-        topRoas.map((t: any) => `   - Increase budget for "${t.campaign.name}" (${t.value.toFixed(2)}x ROAS)`).join('\n') +
+        topRoas.map((t) => `   - Increase budget for "${t.campaign.name}" (${t.value.toFixed(2)}x ROAS)`).join('\n') +
         `\n\n**2. Fix Underperformers:**\n` +
-        (worstRoas.length > 0 ? worstRoas.map((t: any) => `   - Review "${t.campaign.name}" (${t.value.toFixed(2)}x ROAS)`).join('\n') : '   - No severely underperforming campaigns found.') +
+        (worstRoas.length > 0 ? worstRoas.map((t) => `   - Review "${t.campaign.name}" (${t.value.toFixed(2)}x ROAS)`).join('\n') : '   - No severely underperforming campaigns found.') +
         `\n\n**3. General Tips:**\n` +
         `   - ${avgRoas >= 2 ? 'Your account is healthy. Focus on scaling.' : 'Test new audiences and creatives to improve ROAS.'}\n` +
         `   - Monitor frequency to avoid ad fatigue\n` +
@@ -356,7 +371,6 @@ export function processChatQuery(query: string, context: CampaignContext): {
     }
   }
 
-  // Default / fallback
   return {
     response: `I can help you analyze your Meta Ads campaigns. Here are some things you can ask:\n\n` +
       `- "Show me an overview of my campaigns"\n` +

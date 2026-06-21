@@ -1,50 +1,29 @@
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { updateAlertSchema, validateBody, formatZodError } from '@/lib/validation'
 
-export async function PATCH(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const supabase = await createClient()
   const { id } = await params
 
   const { data: { user }, error: authError } = await supabase.auth.getUser()
-
   if (authError || !user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
   const body = await request.json()
-  const { status } = body
+  const validation = validateBody(updateAlertSchema, body)
 
-  if (!status || !['resolved', 'dismissed', 'active'].includes(status)) {
-    return NextResponse.json({ error: 'Invalid status' }, { status: 400 })
+  if (!validation.success) {
+    return NextResponse.json(
+      { error: 'Validation failed', details: formatZodError(validation.error) },
+      { status: 400 }
+    )
   }
 
-  // Get the alert to check workspace access
-  const { data: alert } = await supabase
-    .from('campaign_alerts')
-    .select('workspace_id')
-    .eq('id', id)
-    .single()
+  const { status } = validation.data
 
-  if (!alert) {
-    return NextResponse.json({ error: 'Alert not found' }, { status: 404 })
-  }
-
-  // Verify access
-  const { data: membership } = await supabase
-    .from('workspace_members')
-    .select('role')
-    .eq('workspace_id', alert.workspace_id)
-    .eq('user_id', user.id)
-    .single()
-
-  if (!membership) {
-    return NextResponse.json({ error: 'Access denied' }, { status: 403 })
-  }
-
-  const updates: any = { status }
+  const updates: Record<string, string | null> = { status }
   if (status === 'resolved') {
     updates.resolved_at = new Date().toISOString()
   } else if (status === 'dismissed') {

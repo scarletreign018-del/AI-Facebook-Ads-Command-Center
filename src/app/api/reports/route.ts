@@ -1,5 +1,6 @@
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { createReportSchema, validateBody, formatZodError } from '@/lib/validation'
 import {
   generateCampaignSummaryReport,
   generatePerformanceReport,
@@ -45,11 +46,16 @@ export async function POST(request: Request) {
   }
 
   const body = await request.json()
-  const { workspace_id, report_type, format, title, description, filters } = body
+  const validation = validateBody(createReportSchema, body)
 
-  if (!workspace_id || !report_type || !format) {
-    return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
+  if (!validation.success) {
+    return NextResponse.json(
+      { error: 'Validation failed', details: formatZodError(validation.error) },
+      { status: 400 }
+    )
   }
+
+  const { workspace_id, report_type, format, title, description, filters } = validation.data
 
   // Verify access
   const { data: membership } = await supabase
@@ -119,8 +125,8 @@ export async function POST(request: Request) {
 
         const { data: insightsData } = await query
 
-        const insightMap: Record<string, any> = {}
-        insightsData?.forEach((ins: any) => {
+        const insightMap: Record<string, { impressions: number; clicks: number; spend: number; conversions: number; purchase_value: number; reach: number }> = {}
+        insightsData?.forEach((ins) => {
           const key = ins.entity_id_meta
           if (!insightMap[key]) {
             insightMap[key] = { impressions: 0, clicks: 0, spend: 0, conversions: 0, purchase_value: 0, reach: 0 }
@@ -152,8 +158,8 @@ export async function POST(request: Request) {
 
         const { data: insightsData } = await query
 
-        const byDate: Record<string, any> = {}
-        insightsData?.forEach((ins: any) => {
+        const byDate: Record<string, { date: string; spend: number; revenue: number; purchase_value: number; clicks: number; impressions: number; conversions: number; purchases: number }> = {}
+        insightsData?.forEach((ins) => {
           const date = ins.date
           if (!byDate[date]) {
             byDate[date] = { date, spend: 0, revenue: 0, purchase_value: 0, clicks: 0, impressions: 0, conversions: 0, purchases: 0 }
@@ -167,7 +173,7 @@ export async function POST(request: Request) {
           byDate[date].purchases += ins.purchases || 0
         })
 
-        const timeSeries = Object.values(byDate).sort((a: any, b: any) =>
+        const timeSeries = Object.values(byDate).sort((a, b) =>
           new Date(a.date).getTime() - new Date(b.date).getTime()
         )
 
@@ -187,7 +193,7 @@ export async function POST(request: Request) {
 
         if (filters?.start_date) query = query.gte('date', filters.start_date)
         if (filters?.end_date) query = query.lte('date', filters.end_date)
-        if (filters?.limit) query = query.limit(filters.limit)
+        if (filters?.limit) query = query.limit(filters.limit as number)
         else query = query.limit(10000)
 
         const { data: insightsData } = await query
@@ -259,12 +265,13 @@ export async function POST(request: Request) {
         'Content-Disposition': `attachment; filename="${filename}"`,
       },
     })
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Report generation failed'
     await supabase.from('campaign_reports').update({
       status: 'failed',
-      error_message: error.message || 'Generation failed',
+      error_message: message,
     }).eq('id', reportRecord.id)
 
-    return NextResponse.json({ error: error.message || 'Report generation failed' }, { status: 500 })
+    return NextResponse.json({ error: message }, { status: 500 })
   }
 }

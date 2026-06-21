@@ -1,5 +1,6 @@
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { updateProfileSchema, validateBody, formatZodError } from '@/lib/validation'
 
 export async function PATCH(request: Request) {
   const supabase = await createClient()
@@ -11,15 +12,28 @@ export async function PATCH(request: Request) {
   }
 
   const body = await request.json()
-  const { full_name } = body
+  const validation = validateBody(updateProfileSchema, body)
 
-  if (!full_name) {
-    return NextResponse.json({ error: 'Name is required' }, { status: 400 })
+  if (!validation.success) {
+    return NextResponse.json(
+      { error: 'Validation failed', details: formatZodError(validation.error) },
+      { status: 400 }
+    )
+  }
+
+  const { full_name, avatar_url } = validation.data
+
+  const updates: Record<string, string | undefined> = {}
+  if (full_name !== undefined) updates.full_name = full_name
+  if (avatar_url !== undefined) updates.avatar_url = avatar_url
+
+  if (Object.keys(updates).length === 0) {
+    return NextResponse.json({ error: 'No fields to update' }, { status: 400 })
   }
 
   const { error } = await supabase
     .from('users')
-    .update({ full_name })
+    .update(updates)
     .eq('id', user.id)
 
   if (error) {
@@ -27,9 +41,11 @@ export async function PATCH(request: Request) {
   }
 
   // Also update auth metadata
-  await supabase.auth.updateUser({
-    data: { full_name }
-  })
+  if (full_name !== undefined) {
+    await supabase.auth.updateUser({
+      data: { full_name }
+    })
+  }
 
   return NextResponse.json({ success: true })
 }
