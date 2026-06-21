@@ -6,7 +6,7 @@ import { Job } from 'bull'
 import { syncQueue } from './queue'
 import { createClient } from '@supabase/supabase-js'
 import { logger } from '../logger'
-import MetaAPIClient from '../meta/api-client'
+import { createMetaClient } from '../meta/api-client'
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -53,7 +53,8 @@ syncQueue.process('meta-sync', async (job: Job<SyncJobData>) => {
     job.progress(10)
 
     // 3. Initialize Meta API client
-    const apiClient = new MetaAPIClient(connection.encrypted_access_token)
+    const accessToken = Buffer.from(connection.encrypted_access_token, 'base64').toString()
+    const apiClient = createMetaClient(accessToken)
 
     // 4. Create sync log
     const { data: syncLog } = await supabase
