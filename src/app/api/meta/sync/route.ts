@@ -230,15 +230,26 @@ export async function POST(request: Request) {
               last_synced_at: new Date().toISOString(),
             }))
             
-            await supabase
+            console.log(`Attempting to upsert ${campaignsToUpsert.length} campaigns for ${account.metaId}...`)
+            console.log('Sample campaign data:', campaignsToUpsert[0])
+            
+            const { data: upsertedCampaigns, error: campaignError } = await supabase
               .from('meta_campaigns')
               .upsert(campaignsToUpsert, {
                 onConflict: 'ad_account_id,campaign_id'
               })
+              .select('id, campaign_id')
+            
+            if (campaignError) {
+              console.error(`ERROR upserting campaigns for ${account.metaId}:`, campaignError)
+              throw new Error(`Failed to save campaigns: ${campaignError.message}`)
+            }
             
             totalCampaigns += campaignsData.data.length
             processedRecords += campaignsData.data.length
-            console.log(`Synced ${campaignsData.data.length} campaigns for ${account.metaId}`)
+            console.log(`✅ Successfully synced ${campaignsData.data.length} campaigns for ${account.metaId}`, {
+              upserted: upsertedCampaigns?.length || 0
+            })
           }
         }
 
@@ -300,19 +311,29 @@ export async function POST(request: Request) {
               raw: adsetsData.data.length,
               afterFilter: adsetsToUpsert.length,
               dropped: adsetsData.data.length - adsetsToUpsert.length,
-              reason: adsetsToUpsert.length === 0 ? 'No matching campaigns found' : null
+              reason: adsetsToUpsert.length === 0 ? 'No matching campaigns found' : null,
+              sampleAdsetCampaignId: adsetsData.data[0]?.campaign_id,
+              campaignMapHasIt: campaignMap.has(adsetsData.data[0]?.campaign_id)
             })
             
             if (adsetsToUpsert.length > 0) {
-              await supabase
+              const { data: upsertedAdsets, error: adsetError } = await supabase
                 .from('meta_ad_sets')
                 .upsert(adsetsToUpsert, {
                   onConflict: 'ad_account_id,adset_id'
                 })
+                .select('id, adset_id')
+              
+              if (adsetError) {
+                console.error(`ERROR upserting ad sets for ${account.metaId}:`, adsetError)
+                throw new Error(`Failed to save ad sets: ${adsetError.message}`)
+              }
               
               totalAdSets += adsetsToUpsert.length
               processedRecords += adsetsToUpsert.length
-              console.log(`Synced ${adsetsToUpsert.length} ad sets for ${account.metaId}`)
+              console.log(`✅ Successfully synced ${adsetsToUpsert.length} ad sets for ${account.metaId}`)
+            } else if (adsetsData.data.length > 0) {
+              console.warn(`⚠️ ${adsetsData.data.length} ad sets found but 0 saved - campaign mapping failed!`)
             }
           } else {
             console.log(`No adsets data for ${account.metaId}`)
@@ -364,16 +385,31 @@ export async function POST(request: Request) {
                 last_synced_at: new Date().toISOString(),
               }))
             
+            console.log(`Ads filtering result:`, {
+              raw: adsData.data.length,
+              afterFilter: adsToUpsert.length,
+              campaignMappingsFound: campaignMap.size,
+              adsetMappingsFound: adsetMap.size
+            })
+            
             if (adsToUpsert.length > 0) {
-              await supabase
+              const { data: upsertedAds, error: adsError } = await supabase
                 .from('meta_ads')
                 .upsert(adsToUpsert, {
                   onConflict: 'ad_account_id,ad_id'
                 })
+                .select('id, ad_id')
+              
+              if (adsError) {
+                console.error(`ERROR upserting ads for ${account.metaId}:`, adsError)
+                throw new Error(`Failed to save ads: ${adsError.message}`)
+              }
               
               totalAds += adsToUpsert.length
               processedRecords += adsToUpsert.length
-              console.log(`Synced ${adsToUpsert.length} ads for ${account.metaId}`)
+              console.log(`✅ Successfully synced ${adsToUpsert.length} ads for ${account.metaId}`)
+            } else if (adsData.data.length > 0) {
+              console.warn(`⚠️ ${adsData.data.length} ads found but 0 saved - campaign/adset mapping failed!`)
             }
           } else {
             console.log(`No ads data for ${account.metaId}`)
