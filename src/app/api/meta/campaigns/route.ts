@@ -81,8 +81,9 @@ export async function GET(request: Request) {
   const { data: campaigns, error } = await query
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    console.error('Campaigns query error:', error)
+    return NextResponse.json({ data: [], error: error.message }, { status: 500 })
   }
 
-  return NextResponse.json(campaigns)
+  return NextResponse.json({ data: campaigns || [], error: null })
 }
