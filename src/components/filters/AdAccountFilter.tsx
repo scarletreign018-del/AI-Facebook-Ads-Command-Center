@@ -62,19 +62,8 @@ export default function AdAccountFilter() {
           >
             <option value="all">All Ad Accounts</option>
             
-            {/* Group: Linked to BM */}
-            {hasBMs && selectedBusinessManagerId && filteredAdAccounts.length > 0 && (
-              <optgroup label={`${businessManagers.find(bm => bm.id === selectedBusinessManagerId)?.name || 'Selected Portfolio'} Accounts`}>
-                {filteredAdAccounts.map((acc) => (
-                  <option key={acc.id} value={acc.id}>
-                    {acc.name} ({acc.ad_account_id.replace('act_', '')})
-                  </option>
-                ))}
-              </optgroup>
-            )}
-            
-            {/* Show all if no BM selected */}
-            {(!hasBMs || !selectedBusinessManagerId) && filteredAdAccounts.map((acc) => (
+            {/* Show filtered accounts */}
+            {filteredAdAccounts.map((acc) => (
               <option key={acc.id} value={acc.id}>
                 {acc.name} ({acc.ad_account_id.replace('act_', '')})
               </option>
